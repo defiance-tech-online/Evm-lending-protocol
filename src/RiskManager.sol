@@ -26,6 +26,10 @@ contract RiskManager is IRiskManager {
         positionProvider = IPositionProvider(positionProvider_);
     }
 
+    // =============================================================
+    // RESERVE PARAMETERS
+    // =============================================================
+
     function getCollateralFactor(address asset) external view returns (uint256) {
         return reserveManager.getCollateralFactor(asset);
     }
@@ -38,6 +42,10 @@ contract RiskManager is IRiskManager {
         return reserveManager.getLiquidationBonus(asset);
     }
 
+    // =============================================================
+    // HEALTH FACTOR
+    // =============================================================
+
     function calculateHealthFactor(address user) external view returns (uint256) {
         (uint256 collateralValue, uint256 debtValue) = _getAccountValues(user);
 
@@ -48,6 +56,10 @@ contract RiskManager is IRiskManager {
         return (collateralValue * WAD) / debtValue;
     }
 
+    // =============================================================
+    // BORROW VALIDATION
+    // =============================================================
+
     function canBorrow(address user, address asset, uint256 amount) external view returns (bool) {
         if (amount == 0) {
             return false;
@@ -56,16 +68,36 @@ contract RiskManager is IRiskManager {
         uint256 collateralValue;
         uint256 debtValue;
 
-        (collateralValue, debtValue) = _getAccountValues(user);
+        address[] memory assets = positionProvider.getSupportedAssets();
 
-        uint256 assetValue = _getAssetValue(asset, amount);
+        for (uint256 i = 0; i < assets.length; i++) {
+            address currentAsset = assets[i];
 
-        uint256 collateralFactor = reserveManager.getCollateralFactor(asset);
+            uint256 supplied = positionProvider.getUserCollateral(user, currentAsset);
 
-        uint256 adjustedCollateral = (collateralValue * collateralFactor) / BPS;
+            uint256 borrowed = positionProvider.getUserDebt(user, currentAsset);
 
-        return adjustedCollateral >= debtValue + assetValue;
+            if (supplied > 0) {
+                uint256 value = _getAssetValue(currentAsset, supplied);
+
+                uint256 collateralFactor = reserveManager.getCollateralFactor(currentAsset);
+
+                collateralValue += (value * collateralFactor) / BPS;
+            }
+
+            if (borrowed > 0) {
+                debtValue += _getAssetValue(currentAsset, borrowed);
+            }
+        }
+
+        uint256 newDebt = debtValue + _getAssetValue(asset, amount);
+
+        return collateralValue >= newDebt;
     }
+
+    // =============================================================
+    // LIQUIDATION
+    // =============================================================
 
     function canLiquidate(address user) external view returns (bool) {
         uint256 healthFactor = this.calculateHealthFactor(user);
@@ -89,6 +121,10 @@ contract RiskManager is IRiskManager {
         return _getAmountFromValue(collateralAsset, collateralValue);
     }
 
+    // =============================================================
+    // ACCOUNT VALUES
+    // =============================================================
+
     function _getAccountValues(address user) internal view returns (uint256 collateralValue, uint256 debtValue) {
         address[] memory assets = positionProvider.getSupportedAssets();
 
@@ -100,7 +136,11 @@ contract RiskManager is IRiskManager {
             uint256 debt = positionProvider.getUserDebt(user, asset);
 
             if (collateral > 0) {
-                collateralValue += _getAssetValue(asset, collateral);
+                uint256 value = _getAssetValue(asset, collateral);
+
+                uint256 liquidationThreshold = reserveManager.getLiquidationThreshold(asset);
+
+                collateralValue += (value * liquidationThreshold) / BPS;
             }
 
             if (debt > 0) {
@@ -108,6 +148,10 @@ contract RiskManager is IRiskManager {
             }
         }
     }
+
+    // =============================================================
+    // ASSET VALUE
+    // =============================================================
 
     function _getAssetValue(address asset, uint256 amount) internal view returns (uint256) {
         uint256 price = priceOracle.getPrice(asset);

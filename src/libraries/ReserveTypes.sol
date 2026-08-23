@@ -15,6 +15,11 @@ library ReserveTypes {
         uint256 liquidationThreshold;
         uint256 liquidationBonus;
 
+        address interestRateModel;
+
+        uint256 borrowIndex;
+        uint256 supplyIndex;
+
         uint256 lastUpdateTimestamp;
     }
 }
