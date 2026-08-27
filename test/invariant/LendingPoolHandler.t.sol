@@ -21,6 +21,7 @@ contract LendingPoolHandler is Test {
     uint256 public borrowCalls;
     uint256 public repayCalls;
     uint256 public accrueCalls;
+    uint256 public liquidateCalls;
 
     constructor(
         MockERC20 _weth,
@@ -220,6 +221,51 @@ contract LendingPoolHandler is Test {
     }
 
     // =============================================================
+    // LIQUIDATION
+    // =============================================================
+
+    function liquidateAlice(uint256 debtAmount) external {
+        address user = actors[0];
+        address liquidator = actors[1];
+
+        uint256 debt = lendingPool.getUserDebt(user, address(usdc));
+
+        if (debt == 0) {
+            return;
+        }
+
+        uint256 collateral = lendingPool.getUserCollateral(user, address(weth));
+
+        if (collateral == 0) {
+            return;
+        }
+
+        uint256 liquidatorBalance = usdc.balanceOf(liquidator);
+
+        if (liquidatorBalance == 0) {
+            return;
+        }
+
+        uint256 maxAmount = debt;
+
+        if (maxAmount > liquidatorBalance) {
+            maxAmount = liquidatorBalance;
+        }
+
+        debtAmount = bound(debtAmount, 1, maxAmount);
+
+        vm.startPrank(liquidator);
+
+        usdc.approve(address(lendingPool), debtAmount);
+
+        try lendingPool.liquidate(user, address(usdc), address(weth), debtAmount) {
+            liquidateCalls++;
+        } catch {}
+
+        vm.stopPrank();
+    }
+
+    // =============================================================
     // INTEREST ACCRUAL
     // =============================================================
 
@@ -235,10 +281,10 @@ contract LendingPoolHandler is Test {
     // TIME ADVANCEMENT
     // =============================================================
 
-    function advanceTime(uint256 secondsForward) external {
-        secondsForward = bound(secondsForward, 1 hours, 7 days);
-
-        vm.warp(block.timestamp + secondsForward);
+    function advanceTime(uint256 timeDelta) public {
+        // Bound the time jump to a realistic range (e.g., 1 second to 365 days)
+        timeDelta = bound(timeDelta, 1, 365 days);
+        vm.warp(block.timestamp + timeDelta);
     }
 
     // =============================================================

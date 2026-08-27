@@ -9,11 +9,12 @@ import {ReserveManager} from "./ReserveManager.sol";
 import {RiskManager} from "./RiskManager.sol";
 import {UserTypes} from "./libraries/UserTypes.sol";
 import {IPositionProvider} from "./interfaces/IPositionProvider.sol";
-import {ReserveTypes} from "./libraries/ReserveTypes.sol";
 
 contract LendingPool is IPositionProvider, Ownable {
     using UserTypes for UserTypes.Position;
     using SafeERC20 for IERC20;
+
+    uint256 public constant WAD = 1e18;
 
     ReserveManager public immutable reserveManager;
     RiskManager public riskManager;
@@ -24,11 +25,8 @@ contract LendingPool is IPositionProvider, Ownable {
     mapping(address => bool) internal isSupported;
 
     event Supplied(address indexed user, address indexed asset, uint256 amount);
-
     event Withdrawn(address indexed user, address indexed asset, uint256 amount);
-
     event Borrowed(address indexed user, address indexed asset, uint256 amount);
-
     event Repaid(address indexed user, address indexed asset, uint256 amount);
 
     event Liquidated(
@@ -44,7 +42,6 @@ contract LendingPool is IPositionProvider, Ownable {
 
     constructor(address reserveManager_) Ownable(msg.sender) {
         require(reserveManager_ != address(0), "LendingPool: zero reserve manager");
-
         reserveManager = ReserveManager(reserveManager_);
     }
 
@@ -54,7 +51,6 @@ contract LendingPool is IPositionProvider, Ownable {
 
     function setRiskManager(address riskManager_) external onlyOwner {
         require(riskManager_ != address(0), "LendingPool: zero risk manager");
-
         require(address(riskManager) == address(0), "LendingPool: risk manager already set");
 
         riskManager = RiskManager(riskManager_);
@@ -68,8 +64,8 @@ contract LendingPool is IPositionProvider, Ownable {
 
     function supply(address asset, uint256 amount) external {
         require(amount > 0, "LendingPool: zero supply");
-        _requireActive(asset);
 
+        _requireActive(asset);
         _accrue(asset);
         _registerAsset(asset);
 
@@ -78,15 +74,10 @@ contract LendingPool is IPositionProvider, Ownable {
         UserTypes.Position storage position = positions[msg.sender][asset];
 
         uint256 currentIndex = reserveManager.getSupplyIndex(asset);
+        uint256 scaledAmount = reserveManager.increaseTotalSupplied(asset, amount);
 
-        if (position.supplied > 0) {
-            position.supplied = _balanceFromIndex(position.supplied, position.supplyIndex, currentIndex);
-        }
-
-        position.supplied += amount;
+        position.supplied += scaledAmount;
         position.supplyIndex = currentIndex;
-
-        reserveManager.increaseTotalSupplied(asset, amount);
 
         emit Supplied(msg.sender, asset, amount);
     }
@@ -97,24 +88,24 @@ contract LendingPool is IPositionProvider, Ownable {
 
     function withdraw(address asset, uint256 amount) external {
         require(amount > 0, "LendingPool: zero withdraw");
-        _requireActive(asset);
 
+        _requireActive(asset);
         _accrue(asset);
 
         UserTypes.Position storage position = positions[msg.sender][asset];
 
         uint256 currentIndex = reserveManager.getSupplyIndex(asset);
-
-        uint256 currentBalance = _balanceFromIndex(position.supplied, position.supplyIndex, currentIndex);
+        uint256 currentBalance = _currentSupply(position, currentIndex);
 
         require(currentBalance >= amount, "LendingPool: insufficient collateral");
-
         require(IERC20(asset).balanceOf(address(this)) >= amount, "LendingPool: insufficient liquidity");
 
-        position.supplied = currentBalance - amount;
-        position.supplyIndex = currentIndex;
+        uint256 scaledAmount = reserveManager.decreaseTotalSupplied(asset, amount);
 
-        reserveManager.decreaseTotalSupplied(asset, amount);
+        require(position.supplied >= scaledAmount, "LendingPool: scaled collateral underflow");
+
+        position.supplied -= scaledAmount;
+        position.supplyIndex = currentIndex;
 
         IERC20(asset).safeTransfer(msg.sender, amount);
 
@@ -127,23 +118,14 @@ contract LendingPool is IPositionProvider, Ownable {
 
     function borrow(address asset, uint256 amount) external {
         require(amount > 0, "LendingPool: zero borrow");
+
         _requireActive(asset);
-
         require(reserveManager.isBorrowEnabled(asset), "LendingPool: borrow disabled");
-
         require(address(riskManager) != address(0), "LendingPool: risk manager not set");
 
-        /*
-         * Accrue every asset already used by the account before
-         * asking RiskManager to validate the new debt.
-         *
-         * This keeps the health calculation based on current
-         * indexes.
-         */
         _accrue(asset);
 
         require(riskManager.canBorrow(msg.sender, asset, amount), "LendingPool: borrow not allowed");
-
         require(IERC20(asset).balanceOf(address(this)) >= amount, "LendingPool: insufficient liquidity");
 
         _registerAsset(asset);
@@ -151,15 +133,10 @@ contract LendingPool is IPositionProvider, Ownable {
         UserTypes.Position storage position = positions[msg.sender][asset];
 
         uint256 currentIndex = reserveManager.getBorrowIndex(asset);
+        uint256 scaledAmount = reserveManager.increaseTotalBorrowed(asset, amount);
 
-        if (position.borrowed > 0) {
-            position.borrowed = _balanceFromIndex(position.borrowed, position.borrowIndex, currentIndex);
-        }
-
-        position.borrowed += amount;
+        position.borrowed += scaledAmount;
         position.borrowIndex = currentIndex;
-
-        reserveManager.increaseTotalBorrowed(asset, amount);
 
         IERC20(asset).safeTransfer(msg.sender, amount);
 
@@ -172,15 +149,14 @@ contract LendingPool is IPositionProvider, Ownable {
 
     function repay(address asset, uint256 amount) external {
         require(amount > 0, "LendingPool: zero repay");
-        _requireActive(asset);
 
+        _requireActive(asset);
         _accrue(asset);
 
         UserTypes.Position storage position = positions[msg.sender][asset];
 
         uint256 currentIndex = reserveManager.getBorrowIndex(asset);
-
-        uint256 currentDebt = _balanceFromIndex(position.borrowed, position.borrowIndex, currentIndex);
+        uint256 currentDebt = _currentBorrow(position, currentIndex);
 
         require(currentDebt > 0, "LendingPool: no debt");
 
@@ -188,11 +164,19 @@ contract LendingPool is IPositionProvider, Ownable {
 
         IERC20(asset).safeTransferFrom(msg.sender, address(this), repayAmount);
 
-        position.borrowed = currentDebt - repayAmount;
+        uint256 scaledAmount;
 
+        if (repayAmount == currentDebt) {
+            scaledAmount = position.borrowed;
+            reserveManager.decreaseTotalScaledBorrowed(asset, scaledAmount);
+        } else {
+            scaledAmount = reserveManager.decreaseTotalBorrowed(asset, repayAmount);
+        }
+
+        require(position.borrowed >= scaledAmount, "LendingPool: scaled debt underflow");
+
+        position.borrowed -= scaledAmount;
         position.borrowIndex = currentIndex;
-
-        reserveManager.decreaseTotalBorrowed(asset, repayAmount);
 
         emit Repaid(msg.sender, asset, repayAmount);
     }
@@ -203,9 +187,7 @@ contract LendingPool is IPositionProvider, Ownable {
 
     function liquidate(address user, address debtAsset, address collateralAsset, uint256 debtAmount) external {
         require(user != address(0), "LendingPool: zero user");
-
         require(debtAmount > 0, "LendingPool: zero debt amount");
-
         require(address(riskManager) != address(0), "LendingPool: risk manager not set");
 
         _requireActive(debtAsset);
@@ -219,42 +201,75 @@ contract LendingPool is IPositionProvider, Ownable {
 
         require(riskManager.canLiquidate(user), "LendingPool: position healthy");
 
-        UserTypes.Position storage debtPosition = positions[user][debtAsset];
-
-        uint256 debtIndex = reserveManager.getBorrowIndex(debtAsset);
-
-        uint256 currentDebt = _balanceFromIndex(debtPosition.borrowed, debtPosition.borrowIndex, debtIndex);
-
+        (uint256 currentDebt, uint256 debtIndex) = _getLiquidationDebt(user, debtAsset);
         require(currentDebt > 0, "LendingPool: no debt");
-
         require(debtAmount <= currentDebt, "LendingPool: liquidation exceeds debt");
 
-        UserTypes.Position storage collateralPosition = positions[user][collateralAsset];
-
-        uint256 collateralIndex = reserveManager.getSupplyIndex(collateralAsset);
-
-        uint256 currentCollateral =
-            _balanceFromIndex(collateralPosition.supplied, collateralPosition.supplyIndex, collateralIndex);
+        (uint256 currentCollateral, uint256 collateralIndex) = _getLiquidationCollateral(user, collateralAsset);
 
         uint256 collateralAmount = riskManager.calculateLiquidationCollateral(debtAsset, collateralAsset, debtAmount);
 
         require(collateralAmount <= currentCollateral, "LendingPool: liquidation exceeds collateral");
 
-        require(IERC20(debtAsset).balanceOf(address(this)) >= 0, "LendingPool: invalid");
+        _executeLiquidation(
+            user,
+            debtAsset,
+            collateralAsset,
+            debtAmount,
+            collateralAmount,
+            currentDebt,
+            currentCollateral,
+            debtIndex,
+            collateralIndex
+        );
+    }
 
+    function _executeLiquidation(
+        address user,
+        address debtAsset,
+        address collateralAsset,
+        uint256 debtAmount,
+        uint256 collateralAmount,
+        uint256 currentDebt,
+        uint256 currentCollateral,
+        uint256 debtIndex,
+        uint256 collateralIndex
+    ) internal {
         IERC20(debtAsset).safeTransferFrom(msg.sender, address(this), debtAmount);
 
-        debtPosition.borrowed = currentDebt - debtAmount;
+        UserTypes.Position storage debtPosition = positions[user][debtAsset];
+        UserTypes.Position storage collateralPosition = positions[user][collateralAsset];
 
+        uint256 scaledDebtAmount;
+        uint256 scaledCollateralAmount;
+
+        // Full liquidation must clear the complete scaled position.
+        if (debtAmount == currentDebt) {
+            scaledDebtAmount = debtPosition.borrowed;
+            reserveManager.decreaseTotalScaledBorrowed(debtAsset, scaledDebtAmount);
+        } else {
+            // Partial liquidation uses FLOOR for debt reduction.
+            scaledDebtAmount = reserveManager.decreaseTotalBorrowed(debtAsset, debtAmount);
+        }
+
+        // Collateral is transferred out, so use CEIL for the scaled
+        // reduction. If all displayed collateral is liquidated, clear
+        // the exact scaled position to avoid residual dust.
+        if (collateralAmount == currentCollateral) {
+            scaledCollateralAmount = collateralPosition.supplied;
+            reserveManager.decreaseTotalScaledSupplied(collateralAsset, scaledCollateralAmount);
+        } else {
+            scaledCollateralAmount = reserveManager.decreaseTotalSupplied(collateralAsset, collateralAmount);
+        }
+
+        require(debtPosition.borrowed >= scaledDebtAmount, "LendingPool: scaled debt underflow");
+        require(collateralPosition.supplied >= scaledCollateralAmount, "LendingPool: scaled collateral underflow");
+
+        debtPosition.borrowed -= scaledDebtAmount;
         debtPosition.borrowIndex = debtIndex;
 
-        collateralPosition.supplied = currentCollateral - collateralAmount;
-
+        collateralPosition.supplied -= scaledCollateralAmount;
         collateralPosition.supplyIndex = collateralIndex;
-
-        reserveManager.decreaseTotalBorrowed(debtAsset, debtAmount);
-
-        reserveManager.decreaseTotalSupplied(collateralAsset, collateralAmount);
 
         IERC20(collateralAsset).safeTransfer(msg.sender, collateralAmount);
 
@@ -274,7 +289,7 @@ contract LendingPool is IPositionProvider, Ownable {
 
         uint256 currentIndex = reserveManager.getCurrentSupplyIndex(asset);
 
-        return _balanceFromIndex(position.supplied, position.supplyIndex, currentIndex);
+        return (position.supplied * currentIndex) / WAD;
     }
 
     function getUserDebt(address user, address asset) public view override returns (uint256) {
@@ -286,12 +301,11 @@ contract LendingPool is IPositionProvider, Ownable {
 
         uint256 currentIndex = reserveManager.getCurrentBorrowIndex(asset);
 
-        return _balanceFromIndex(position.borrowed, position.borrowIndex, currentIndex);
+        return (position.borrowed * currentIndex) / WAD;
     }
 
     function getHealthFactor(address user) external view returns (uint256) {
         require(address(riskManager) != address(0), "LendingPool: risk manager not set");
-
         return riskManager.calculateHealthFactor(user);
     }
 
@@ -304,14 +318,72 @@ contract LendingPool is IPositionProvider, Ownable {
         view
         returns (uint256 supplied, uint256 borrowed, uint256 supplyIndex, uint256 borrowIndex)
     {
-        UserTypes.Position memory position = positions[user][asset];
-
         supplied = getUserCollateral(user, asset);
-
         borrowed = getUserDebt(user, asset);
 
-        supplyIndex = position.supplyIndex;
-        borrowIndex = position.borrowIndex;
+        supplyIndex = reserveManager.getCurrentSupplyIndex(asset);
+        borrowIndex = reserveManager.getCurrentBorrowIndex(asset);
+    }
+
+    // =============================================================
+    // SCALED POSITION VIEWS
+    // =============================================================
+
+    function getUserScaledPosition(address user, address asset)
+        external
+        view
+        returns (uint256 supplied, uint256 borrowed)
+    {
+        UserTypes.Position memory position = positions[user][asset];
+
+        supplied = position.supplied;
+        borrowed = position.borrowed;
+    }
+
+    // =============================================================
+    // INTERNAL - LIQUIDATION VIEWS
+    // =============================================================
+
+    function _getLiquidationDebt(address user, address asset)
+        internal
+        view
+        returns (uint256 currentDebt, uint256 currentIndex)
+    {
+        UserTypes.Position memory position = positions[user][asset];
+
+        currentIndex = reserveManager.getBorrowIndex(asset);
+        currentDebt = _currentBorrow(position, currentIndex);
+    }
+
+    function _getLiquidationCollateral(address user, address asset)
+        internal
+        view
+        returns (uint256 currentCollateral, uint256 currentIndex)
+    {
+        UserTypes.Position memory position = positions[user][asset];
+
+        currentIndex = reserveManager.getSupplyIndex(asset);
+        currentCollateral = _currentSupply(position, currentIndex);
+    }
+
+    // =============================================================
+    // INTERNAL - BALANCE
+    // =============================================================
+
+    function _currentSupply(UserTypes.Position memory position, uint256 currentIndex) internal pure returns (uint256) {
+        if (position.supplied == 0) {
+            return 0;
+        }
+
+        return (position.supplied * currentIndex) / WAD;
+    }
+
+    function _currentBorrow(UserTypes.Position memory position, uint256 currentIndex) internal pure returns (uint256) {
+        if (position.borrowed == 0) {
+            return 0;
+        }
+
+        return (position.borrowed * currentIndex) / WAD;
     }
 
     // =============================================================
@@ -331,21 +403,5 @@ contract LendingPool is IPositionProvider, Ownable {
 
     function _accrue(address asset) internal {
         reserveManager.accrueInterest(asset);
-    }
-
-    function _balanceFromIndex(uint256 principal, uint256 userIndex, uint256 currentIndex)
-        internal
-        pure
-        returns (uint256)
-    {
-        if (principal == 0) {
-            return 0;
-        }
-
-        if (userIndex == 0) {
-            return principal;
-        }
-
-        return (principal * currentIndex) / userIndex;
     }
 }

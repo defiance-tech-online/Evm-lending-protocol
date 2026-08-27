@@ -8,14 +8,30 @@ library ReserveTypes {
 
         uint8 decimals;
 
-        uint256 totalSupplied;
-        uint256 totalBorrowed;
+        // =============================================================
+        // SCALED ACCOUNTING
+        // =============================================================
+        //
+        // Actual supplied balance:
+        //
+        // totalScaledSupplied * supplyIndex / 1e18
+        //
+        // Actual borrowed balance:
+        //
+        // totalScaledBorrowed * borrowIndex / 1e18
+        //
+        uint256 totalScaledSupplied;
+        uint256 totalScaledBorrowed;
 
         uint256 collateralFactor;
         uint256 liquidationThreshold;
         uint256 liquidationBonus;
 
         address interestRateModel;
+
+        // =============================================================
+        // INTEREST INDICES
+        // =============================================================
 
         uint256 borrowIndex;
         uint256 supplyIndex;

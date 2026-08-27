@@ -3,95 +3,101 @@ pragma solidity ^0.8.24;
 
 import {Test} from "forge-std/Test.sol";
 
-import {MockERC20} from "../../src/tokens/MockERC20.sol";
-import {MockPriceOracle} from "../../src/oracles/MockPriceOracle.sol";
-import {InterestRateModel} from "../../src/InterestRateModel.sol";
-import {ReserveManager} from "../../src/ReserveManager.sol";
 import {LendingPool} from "../../src/LendingPool.sol";
+import {ReserveManager} from "../../src/ReserveManager.sol";
 import {RiskManager} from "../../src/RiskManager.sol";
+import {InterestRateModel} from "../../src/InterestRateModel.sol";
+import {MockPriceOracle} from "../../src/oracles/MockPriceOracle.sol";
+import {MockERC20} from "../../src/tokens/MockERC20.sol";
 
 contract LendingPoolTest is Test {
-    MockERC20 weth;
-    MockERC20 usdc;
-
-    MockPriceOracle priceOracle;
-    InterestRateModel interestRateModel;
-
+    LendingPool pool;
     ReserveManager reserveManager;
-    LendingPool lendingPool;
     RiskManager riskManager;
+    InterestRateModel interestRateModel;
+    MockPriceOracle oracle;
+
+    MockERC20 usdc;
+    MockERC20 weth;
 
     address alice = makeAddr("alice");
     address bob = makeAddr("bob");
+    address liquidator = makeAddr("liquidator");
 
-    uint256 constant USDC = 1e6;
-    uint256 constant WETH = 1e18;
+    uint256 constant USDC_AMOUNT = 1_000e6;
+    uint256 constant WETH_AMOUNT = 10e18;
 
     function setUp() public {
-        weth = new MockERC20("Mock WETH", "mWETH", 18);
-
-        usdc = new MockERC20("Mock USDC", "mUSDC", 6);
-
-        priceOracle = new MockPriceOracle();
+        reserveManager = new ReserveManager();
+        oracle = new MockPriceOracle();
         interestRateModel = new InterestRateModel();
 
-        reserveManager = new ReserveManager();
+        usdc = new MockERC20("USD Coin", "USDC", 6);
+        weth = new MockERC20("Wrapped Ether", "WETH", 18);
 
-        reserveManager.configureReserve(address(weth), 18, 8_000, 8_500, 500);
+        pool = new LendingPool(address(reserveManager));
+
+        reserveManager.setLendingPool(address(pool));
+
+        riskManager = new RiskManager(address(reserveManager), address(oracle), address(pool));
+
+        pool.setRiskManager(address(riskManager));
 
         reserveManager.configureReserve(address(usdc), 6, 8_000, 8_500, 500);
 
-        reserveManager.setInterestRateModel(address(weth), address(interestRateModel));
+        reserveManager.configureReserve(address(weth), 18, 8_000, 8_500, 500);
 
         reserveManager.setInterestRateModel(address(usdc), address(interestRateModel));
 
-        lendingPool = new LendingPool(address(reserveManager));
+        reserveManager.setInterestRateModel(address(weth), address(interestRateModel));
 
-        reserveManager.setLendingPool(address(lendingPool));
+        oracle.setPrice(address(usdc), 1e8, 8);
+        oracle.setPrice(address(weth), 2_000e8, 8);
 
-        riskManager = new RiskManager(address(reserveManager), address(priceOracle), address(lendingPool));
+        // ---------------------------------------------------------
+        // Mint user balances
+        // ---------------------------------------------------------
 
-        lendingPool.setRiskManager(address(riskManager));
+        usdc.mint(alice, USDC_AMOUNT * 10);
+        usdc.mint(bob, USDC_AMOUNT * 20);
+        usdc.mint(liquidator, USDC_AMOUNT * 10);
 
-        priceOracle.setPrice(address(weth), 3000e8, 8);
+        weth.mint(alice, WETH_AMOUNT * 10);
+        weth.mint(bob, WETH_AMOUNT * 10);
 
-        priceOracle.setPrice(address(usdc), 1e8, 8);
-
-        weth.mint(alice, 20 * WETH);
-
-        weth.mint(bob, 20 * WETH);
-
-        usdc.mint(alice, 20_000 * USDC);
-
-        usdc.mint(bob, 20_000 * USDC);
-    }
-
-    // =============================================================
-    // HELPERS
-    // =============================================================
-
-    function _provideUSDC() internal {
-        vm.startPrank(bob);
-
-        usdc.approve(address(lendingPool), 10_000 * USDC);
-
-        lendingPool.supply(address(usdc), 10_000 * USDC);
-
-        vm.stopPrank();
-    }
-
-    function _createBorrowPosition() internal {
-        _provideUSDC();
+        // ---------------------------------------------------------
+        // Approvals
+        // ---------------------------------------------------------
 
         vm.startPrank(alice);
 
-        weth.approve(address(lendingPool), 2 * WETH);
-
-        lendingPool.supply(address(weth), 2 * WETH);
-
-        lendingPool.borrow(address(usdc), 1_000 * USDC);
+        usdc.approve(address(pool), type(uint256).max);
+        weth.approve(address(pool), type(uint256).max);
 
         vm.stopPrank();
+
+        vm.startPrank(bob);
+
+        usdc.approve(address(pool), type(uint256).max);
+        weth.approve(address(pool), type(uint256).max);
+
+        vm.stopPrank();
+
+        vm.startPrank(liquidator);
+
+        usdc.approve(address(pool), type(uint256).max);
+
+        vm.stopPrank();
+
+        // ---------------------------------------------------------
+        // Seed USDC liquidity
+        //
+        // Borrowers cannot borrow unless the pool actually owns
+        // enough USDC.
+        // ---------------------------------------------------------
+
+        vm.prank(bob);
+        pool.supply(address(usdc), 10_000e6);
     }
 
     // =============================================================
@@ -99,497 +105,533 @@ contract LendingPoolTest is Test {
     // =============================================================
 
     function test_Supply() public {
+        uint256 amount = 1_000e6;
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+
+        vm.prank(alice);
+        pool.supply(address(usdc), amount);
+
+        assertEq(pool.getUserCollateral(alice, address(usdc)), amount);
+
+        (uint256 scaledSupply,) = pool.getUserScaledPosition(alice, address(usdc));
+
+        assertEq(scaledSupply, amount);
+
+        assertEq(reserveManager.getTotalScaledSupplied(address(usdc)), 11_000e6);
+
+        assertEq(reserveManager.getTotalSupplied(address(usdc)), 11_000e6);
+
+        assertEq(usdc.balanceOf(address(pool)), 11_000e6);
+
+        assertEq(usdc.balanceOf(alice), aliceBefore - amount);
+    }
+
+    function test_SupplyMultipleTimes() public {
         vm.startPrank(alice);
 
-        weth.approve(address(lendingPool), 1 * WETH);
-
-        lendingPool.supply(address(weth), 1 * WETH);
+        pool.supply(address(usdc), 500e6);
+        pool.supply(address(usdc), 700e6);
 
         vm.stopPrank();
 
-        assertEq(lendingPool.getUserCollateral(alice, address(weth)), 1 * WETH);
+        assertEq(pool.getUserCollateral(alice, address(usdc)), 1_200e6);
 
-        assertEq(reserveManager.getTotalSupplied(address(weth)), 1 * WETH);
+        (uint256 scaledSupply,) = pool.getUserScaledPosition(alice, address(usdc));
+
+        assertEq(scaledSupply, 1_200e6);
     }
 
-    function test_Withdraw() public {
-        vm.startPrank(alice);
+    function test_RevertIfSupplyZero() public {
+        vm.prank(alice);
 
-        weth.approve(address(lendingPool), 1 * WETH);
-
-        lendingPool.supply(address(weth), 1 * WETH);
-
-        lendingPool.withdraw(address(weth), 500_000_000_000_000_000);
-
-        vm.stopPrank();
-
-        assertEq(lendingPool.getUserCollateral(alice, address(weth)), 500_000_000_000_000_000);
-    }
-
-    function test_RevertIfZeroSupply() public {
         vm.expectRevert("LendingPool: zero supply");
 
-        lendingPool.supply(address(weth), 0);
+        pool.supply(address(usdc), 0);
     }
 
-    function test_RevertIfZeroWithdraw() public {
+    // =============================================================
+    // WITHDRAW
+    // =============================================================
+
+    function test_Withdraw() public {
+        uint256 amount = 1_000e6;
+
+        vm.startPrank(alice);
+
+        pool.supply(address(usdc), amount);
+
+        pool.withdraw(address(usdc), 400e6);
+
+        vm.stopPrank();
+
+        assertEq(pool.getUserCollateral(alice, address(usdc)), 600e6);
+
+        (uint256 scaledSupply,) = pool.getUserScaledPosition(alice, address(usdc));
+
+        assertEq(scaledSupply, 600e6);
+
+        assertEq(reserveManager.getTotalScaledSupplied(address(usdc)), 10_600e6);
+
+        assertEq(reserveManager.getTotalSupplied(address(usdc)), 10_600e6);
+
+        assertEq(usdc.balanceOf(alice), USDC_AMOUNT * 10 - 600e6);
+    }
+
+    function test_RevertIfWithdrawZero() public {
+        vm.prank(alice);
+
         vm.expectRevert("LendingPool: zero withdraw");
 
-        lendingPool.withdraw(address(weth), 0);
+        pool.withdraw(address(usdc), 0);
     }
 
     function test_RevertIfWithdrawTooMuch() public {
         vm.startPrank(alice);
 
-        weth.approve(address(lendingPool), 1 * WETH);
-
-        lendingPool.supply(address(weth), 1 * WETH);
+        pool.supply(address(usdc), 1_000e6);
 
         vm.expectRevert("LendingPool: insufficient collateral");
 
-        lendingPool.withdraw(address(weth), 2 * WETH);
+        pool.withdraw(address(usdc), 1_001e6);
 
         vm.stopPrank();
+    }
+
+    function test_RevertIfWithdrawWithoutCollateral() public {
+        vm.prank(alice);
+
+        vm.expectRevert("LendingPool: insufficient collateral");
+
+        pool.withdraw(address(usdc), 1e6);
     }
 
     // =============================================================
     // BORROW
     // =============================================================
 
-    function test_BorrowAgainstCollateral() public {
-        _provideUSDC();
-
+    function test_Borrow() public {
         vm.startPrank(alice);
 
-        weth.approve(address(lendingPool), 2 * WETH);
+        pool.supply(address(weth), 1e18);
 
-        lendingPool.supply(address(weth), 2 * WETH);
-
-        lendingPool.borrow(address(usdc), 1_000 * USDC);
+        pool.borrow(address(usdc), 1_000e6);
 
         vm.stopPrank();
 
-        assertEq(lendingPool.getUserDebt(alice, address(usdc)), 1_000 * USDC);
+        assertEq(pool.getUserDebt(alice, address(usdc)), 1_000e6);
+
+        (, uint256 scaledDebt) = pool.getUserScaledPosition(alice, address(usdc));
+
+        assertEq(scaledDebt, 1_000e6);
+
+        assertEq(reserveManager.getTotalScaledBorrowed(address(usdc)), 1_000e6);
+
+        assertEq(usdc.balanceOf(alice), USDC_AMOUNT * 10 + 1_000e6);
     }
 
-    function test_BorrowUSDCAgainstWETHCollateral() public {
-        _provideUSDC();
+    function test_RevertIfBorrowZero() public {
+        vm.prank(alice);
 
-        vm.startPrank(alice);
+        vm.expectRevert("LendingPool: zero borrow");
 
-        weth.approve(address(lendingPool), 2 * WETH);
-
-        lendingPool.supply(address(weth), 2 * WETH);
-
-        lendingPool.borrow(address(usdc), 1_000 * USDC);
-
-        vm.stopPrank();
-
-        assertGt(lendingPool.getUserDebt(alice, address(usdc)), 0);
+        pool.borrow(address(usdc), 0);
     }
 
-    function test_RevertIfBorrowWithoutCollateral() public {
-        _provideUSDC();
-
+    function test_RevertIfBorrowExceedsCollateral() public {
         vm.startPrank(alice);
+
+        pool.supply(address(weth), 1e18);
 
         vm.expectRevert("LendingPool: borrow not allowed");
 
-        lendingPool.borrow(address(usdc), 1_000 * USDC);
+        pool.borrow(address(usdc), 2_000e6);
 
         vm.stopPrank();
     }
 
-    function test_RevertIfBorrowExceedsCollateralFactor() public {
-        _provideUSDC();
+    function test_RevertIfBorrowWithoutLiquidity() public {
+        // Drain the seeded USDC liquidity by withdrawing Bob's supply.
+        vm.startPrank(bob);
+
+        pool.withdraw(address(usdc), 10_000e6);
+
+        vm.stopPrank();
 
         vm.startPrank(alice);
 
-        weth.approve(address(lendingPool), 1 * WETH);
+        pool.supply(address(weth), 1e18);
 
-        lendingPool.supply(address(weth), 1 * WETH);
+        vm.expectRevert("LendingPool: insufficient liquidity");
 
-        vm.expectRevert("LendingPool: borrow not allowed");
-
-        lendingPool.borrow(address(usdc), 3_000 * USDC);
+        pool.borrow(address(usdc), 1_000e6);
 
         vm.stopPrank();
+    }
+
+    // =============================================================
+    // REPAY
+    // =============================================================
+
+    function test_PartialRepay() public {
+        vm.startPrank(alice);
+
+        pool.supply(address(weth), 1e18);
+        pool.borrow(address(usdc), 1_000e6);
+
+        pool.repay(address(usdc), 400e6);
+
+        vm.stopPrank();
+
+        assertEq(pool.getUserDebt(alice, address(usdc)), 600e6);
+
+        (, uint256 scaledDebt) = pool.getUserScaledPosition(alice, address(usdc));
+
+        assertEq(scaledDebt, 600e6);
+
+        assertEq(reserveManager.getTotalScaledBorrowed(address(usdc)), 600e6);
+    }
+
+    function test_FullRepay() public {
+        vm.startPrank(alice);
+
+        pool.supply(address(weth), 1e18);
+        pool.borrow(address(usdc), 1_000e6);
+
+        pool.repay(address(usdc), type(uint256).max);
+
+        vm.stopPrank();
+
+        assertEq(pool.getUserDebt(alice, address(usdc)), 0);
+
+        (, uint256 scaledDebt) = pool.getUserScaledPosition(alice, address(usdc));
+
+        assertEq(scaledDebt, 0);
+
+        assertEq(reserveManager.getTotalScaledBorrowed(address(usdc)), 0);
+    }
+
+    function test_RepayCannotExceedDebt() public {
+        vm.startPrank(alice);
+
+        pool.supply(address(weth), 1e18);
+        pool.borrow(address(usdc), 1_000e6);
+
+        pool.repay(address(usdc), 2_000e6);
+
+        vm.stopPrank();
+
+        assertEq(pool.getUserDebt(alice, address(usdc)), 0);
+
+        (, uint256 scaledDebt) = pool.getUserScaledPosition(alice, address(usdc));
+
+        assertEq(scaledDebt, 0);
+    }
+
+    function test_RevertIfRepayZero() public {
+        vm.prank(alice);
+
+        vm.expectRevert("LendingPool: zero repay");
+
+        pool.repay(address(usdc), 0);
+    }
+
+    function test_RevertIfRepayWithoutDebt() public {
+        vm.prank(alice);
+
+        vm.expectRevert("LendingPool: no debt");
+
+        pool.repay(address(usdc), 1e6);
     }
 
     // =============================================================
     // INTEREST
     // =============================================================
 
-    function test_BorrowInterestAccrues() public {
-        _createBorrowPosition();
-
-        uint256 beforeDebt = lendingPool.getUserDebt(alice, address(usdc));
-
-        vm.warp(block.timestamp + 365 days);
-
-        uint256 afterDebt = lendingPool.getUserDebt(alice, address(usdc));
-
-        assertGt(afterDebt, beforeDebt);
-    }
-
-    function test_SupplyInterestAccrues() public {
-        _createBorrowPosition();
-
-        uint256 beforeBalance = lendingPool.getUserCollateral(bob, address(usdc));
-
-        vm.warp(block.timestamp + 365 days);
-
-        uint256 afterBalance = lendingPool.getUserCollateral(bob, address(usdc));
-
-        assertGt(afterBalance, beforeBalance);
-    }
-
-    function test_BorrowSnapshotUpdatesAfterAdditionalBorrow() public {
-        _provideUSDC();
-
+    function test_DebtAccruesInterest() public {
         vm.startPrank(alice);
 
-        weth.approve(address(lendingPool), 2 * WETH);
-
-        lendingPool.supply(address(weth), 2 * WETH);
-
-        lendingPool.borrow(address(usdc), 500 * USDC);
-
-        vm.warp(block.timestamp + 365 days);
-
-        lendingPool.borrow(address(usdc), 500 * USDC);
+        pool.supply(address(weth), 1e18);
+        pool.borrow(address(usdc), 1_000e6);
 
         vm.stopPrank();
 
-        assertGt(lendingPool.getUserDebt(alice, address(usdc)), 1_000 * USDC);
-    }
-
-    function test_SupplySnapshotUpdatesAfterAdditionalSupply() public {
-        _createBorrowPosition();
+        uint256 initialDebt = pool.getUserDebt(alice, address(usdc));
 
         vm.warp(block.timestamp + 365 days);
+
+        uint256 finalDebt = pool.getUserDebt(alice, address(usdc));
+
+        assertGt(finalDebt, initialDebt);
+    }
+
+    function test_CollateralAccruesInterest() public {
+        vm.prank(alice);
+        pool.supply(address(usdc), 1_000e6);
 
         vm.startPrank(bob);
 
-        usdc.approve(address(lendingPool), 1_000 * USDC);
-
-        lendingPool.supply(address(usdc), 1_000 * USDC);
-
-        vm.stopPrank();
-
-        assertGt(lendingPool.getUserCollateral(bob, address(usdc)), 11_000 * USDC);
-    }
-
-    function test_Repay() public {
-        _provideUSDC();
-
-        vm.startPrank(alice);
-
-        weth.approve(address(lendingPool), 2 * WETH);
-
-        lendingPool.supply(address(weth), 2 * WETH);
-
-        lendingPool.borrow(address(usdc), 1_000 * USDC);
-
-        /*
-         * The original USDC approval was consumed
-         * when supplying USDC. Alice therefore needs
-         * a new allowance for repayment.
-         */
-        usdc.approve(address(lendingPool), 500 * USDC);
-
-        lendingPool.repay(address(usdc), 500 * USDC);
+        pool.supply(address(weth), 1e18);
+        pool.borrow(address(usdc), 500e6);
 
         vm.stopPrank();
 
-        assertLt(lendingPool.getUserDebt(alice, address(usdc)), 1_000 * USDC);
-    }
-
-    function test_RepayAccruedDebt() public {
-        _createBorrowPosition();
+        uint256 initialCollateral = pool.getUserCollateral(alice, address(usdc));
 
         vm.warp(block.timestamp + 365 days);
 
-        uint256 debt = lendingPool.getUserDebt(alice, address(usdc));
+        uint256 finalCollateral = pool.getUserCollateral(alice, address(usdc));
 
-        vm.startPrank(alice);
-
-        usdc.mint(alice, debt);
-
-        usdc.approve(address(lendingPool), debt);
-
-        lendingPool.repay(address(usdc), debt);
-
-        vm.stopPrank();
-
-        assertEq(lendingPool.getUserDebt(alice, address(usdc)), 0);
+        assertGt(finalCollateral, initialCollateral);
     }
 
-    function test_RepayMoreThanDebt() public {
-        _provideUSDC();
-
+    function test_ScaledDebtDoesNotChangeFromInterest() public {
         vm.startPrank(alice);
 
-        weth.approve(address(lendingPool), 2 * WETH);
-
-        lendingPool.supply(address(weth), 2 * WETH);
-
-        lendingPool.borrow(address(usdc), 1_000 * USDC);
-
-        usdc.approve(address(lendingPool), 2_000 * USDC);
-
-        lendingPool.repay(address(usdc), 2_000 * USDC);
+        pool.supply(address(weth), 1e18);
+        pool.borrow(address(usdc), 1_000e6);
 
         vm.stopPrank();
 
-        assertEq(lendingPool.getUserDebt(alice, address(usdc)), 0);
-    }
+        (, uint256 scaledBefore) = pool.getUserScaledPosition(alice, address(usdc));
 
-    // =============================================================
-    // LIQUIDATION
-    // =============================================================
+        vm.warp(block.timestamp + 365 days);
 
-    function test_LiquidateUnderwaterPosition() public {
-        // ---------------------------------------------------------
-        // 1. Provide USDC liquidity to the pool
-        // ---------------------------------------------------------
-        vm.startPrank(bob);
+        // View functions preview the current index.
+        uint256 debt = pool.getUserDebt(alice, address(usdc));
 
-        usdc.approve(address(lendingPool), 10_000 * USDC);
+        (, uint256 scaledAfter) = pool.getUserScaledPosition(alice, address(usdc));
 
-        lendingPool.supply(address(usdc), 10_000 * USDC);
-
-        vm.stopPrank();
-
-        // ---------------------------------------------------------
-        // 2. Alice supplies WETH and borrows USDC
-        // ---------------------------------------------------------
-        vm.startPrank(alice);
-
-        weth.approve(address(lendingPool), 2 * WETH);
-
-        lendingPool.supply(address(weth), 2 * WETH);
-
-        lendingPool.borrow(address(usdc), 1_000 * USDC);
-
-        vm.stopPrank();
-
-        // ---------------------------------------------------------
-        // 3. WETH price crashes
-        // ---------------------------------------------------------
-        priceOracle.setPrice(address(weth), 500e8, 8);
-
-        uint256 collateralBefore = lendingPool.getUserCollateral(alice, address(weth));
-
-        // ---------------------------------------------------------
-        // 4. Bob liquidates part of Alice's debt
-        // ---------------------------------------------------------
-        vm.startPrank(bob);
-
-        usdc.approve(address(lendingPool), 900 * USDC);
-
-        lendingPool.liquidate(alice, address(usdc), address(weth), 900 * USDC);
-
-        vm.stopPrank();
-
-        // ---------------------------------------------------------
-        // 5. Verify liquidation
-        // ---------------------------------------------------------
-        assertEq(lendingPool.getUserDebt(alice, address(usdc)), 100 * USDC);
-
-        assertLt(lendingPool.getUserCollateral(alice, address(weth)), collateralBefore);
-    }
-
-    function test_RevertIfLiquidateHealthyPosition() public {
-        _createBorrowPosition();
-
-        vm.startPrank(bob);
-
-        usdc.approve(address(lendingPool), 1_000 * USDC);
-
-        vm.expectRevert("LendingPool: position healthy");
-
-        lendingPool.liquidate(alice, address(usdc), address(weth), 1_000 * USDC);
-
-        vm.stopPrank();
+        assertGt(debt, 1_000e6);
+        assertEq(scaledAfter, scaledBefore);
     }
 
     // =============================================================
     // MULTI USER
     // =============================================================
 
-    function test_MultipleUsers() public {
-        vm.startPrank(alice);
+    function test_MultipleUsersSupply() public {
+        vm.prank(alice);
+        pool.supply(address(usdc), 1_000e6);
 
-        weth.approve(address(lendingPool), 1 * WETH);
+        vm.prank(bob);
+        pool.supply(address(usdc), 2_000e6);
 
-        lendingPool.supply(address(weth), 1 * WETH);
+        assertEq(reserveManager.getTotalScaledSupplied(address(usdc)), 13_000e6);
 
-        vm.stopPrank();
+        assertEq(pool.getUserCollateral(alice, address(usdc)), 1_000e6);
 
-        vm.startPrank(bob);
-
-        weth.approve(address(lendingPool), 2 * WETH);
-
-        lendingPool.supply(address(weth), 2 * WETH);
-
-        vm.stopPrank();
-
-        assertEq(lendingPool.getUserCollateral(alice, address(weth)), 1 * WETH);
-
-        assertEq(lendingPool.getUserCollateral(bob, address(weth)), 2 * WETH);
+        assertEq(pool.getUserCollateral(bob, address(usdc)), 12_000e6);
     }
 
-    function test_RevertIfNonOwnerSetsRiskManager() public {
-        RiskManager newRiskManager =
-            new RiskManager(address(reserveManager), address(priceOracle), address(lendingPool));
+    function test_MultipleUsersBorrow() public {
+        vm.prank(alice);
+        pool.supply(address(weth), 2e18);
+
+        vm.prank(bob);
+        pool.supply(address(weth), 2e18);
 
         vm.prank(alice);
+        pool.borrow(address(usdc), 1_000e6);
 
-        vm.expectRevert();
-        lendingPool.setRiskManager(address(newRiskManager));
+        vm.prank(bob);
+        pool.borrow(address(usdc), 1_000e6);
+
+        assertEq(reserveManager.getTotalScaledBorrowed(address(usdc)), 2_000e6);
     }
 
-    function test_RevertIfRiskManagerSetTwice() public {
-        RiskManager newRiskManager =
-            new RiskManager(address(reserveManager), address(priceOracle), address(lendingPool));
+    // =============================================================
+    // POSITION VIEWS
+    // =============================================================
 
-        vm.expectRevert("LendingPool: risk manager already set");
-
-        lendingPool.setRiskManager(address(newRiskManager));
-    }
-
-    function test_RevertIfZeroRiskManager() public {
-        vm.expectRevert("LendingPool: zero risk manager");
-
-        lendingPool.setRiskManager(address(0));
-    }
-
-    function testFuzz_Supply(uint256 amount) public {
-        amount = bound(amount, 1, 10 * WETH);
-
+    function test_GetUserPosition() public {
         vm.startPrank(alice);
 
-        weth.approve(address(lendingPool), amount);
-
-        lendingPool.supply(address(weth), amount);
+        pool.supply(address(weth), 1e18);
+        pool.borrow(address(usdc), 1_000e6);
 
         vm.stopPrank();
 
-        assertEq(lendingPool.getUserCollateral(alice, address(weth)), amount);
+        (uint256 supplied, uint256 borrowed, uint256 supplyIndex, uint256 borrowIndex) =
+            pool.getUserPosition(alice, address(weth));
+
+        assertEq(supplied, 1e18);
+        assertEq(borrowed, 0);
+        assertGt(supplyIndex, 0);
+        assertGt(borrowIndex, 0);
+
+        (uint256 usdcSupplied, uint256 usdcBorrowed, uint256 usdcSupplyIndex, uint256 usdcBorrowIndex) =
+            pool.getUserPosition(alice, address(usdc));
+
+        assertEq(usdcSupplied, 0);
+        assertEq(usdcBorrowed, 1_000e6);
+        assertGt(usdcSupplyIndex, 0);
+        assertGt(usdcBorrowIndex, 0);
     }
 
-    function testFuzz_Withdraw(uint256 supplyAmount, uint256 withdrawAmount) public {
-        supplyAmount = bound(supplyAmount, 1, 10 * WETH);
-        withdrawAmount = bound(withdrawAmount, 1, supplyAmount);
-
+    function test_GetUserScaledPosition() public {
         vm.startPrank(alice);
 
-        weth.approve(address(lendingPool), supplyAmount);
-
-        lendingPool.supply(address(weth), supplyAmount);
-
-        lendingPool.withdraw(address(weth), withdrawAmount);
+        pool.supply(address(weth), 1e18);
+        pool.borrow(address(usdc), 1_000e6);
 
         vm.stopPrank();
 
-        assertEq(lendingPool.getUserCollateral(alice, address(weth)), supplyAmount - withdrawAmount);
+        (uint256 supplied, uint256 borrowed) = pool.getUserScaledPosition(alice, address(weth));
+
+        assertEq(supplied, 1e18);
+        assertEq(borrowed, 0);
+
+        (, borrowed) = pool.getUserScaledPosition(alice, address(usdc));
+
+        assertEq(borrowed, 1_000e6);
     }
 
-    function testFuzz_Borrow(uint256 borrowAmount) public {
-        borrowAmount = bound(borrowAmount, 1 * USDC, 4_000 * USDC);
+    function test_GetSupportedAssets() public {
+        vm.prank(alice);
+        pool.supply(address(weth), 1e18);
 
-        _provideUSDC();
+        vm.prank(alice);
+        pool.supply(address(usdc), 1_000e6);
 
+        address[] memory assets = pool.getSupportedAssets();
+
+        assertEq(assets.length, 2);
+        assertEq(assets[0], address(usdc));
+        assertEq(assets[1], address(weth));
+    }
+
+    // =============================================================
+    // HEALTH FACTOR
+    // =============================================================
+
+    function test_HealthFactor() public {
         vm.startPrank(alice);
 
-        weth.approve(address(lendingPool), 2 * WETH);
-
-        lendingPool.supply(address(weth), 2 * WETH);
-
-        lendingPool.borrow(address(usdc), borrowAmount);
+        pool.supply(address(weth), 1e18);
+        pool.borrow(address(usdc), 1_000e6);
 
         vm.stopPrank();
 
-        assertEq(lendingPool.getUserDebt(alice, address(usdc)), borrowAmount);
+        uint256 healthFactor = pool.getHealthFactor(alice);
+
+        assertGt(healthFactor, 1e18);
     }
 
-    function testFuzz_Repay(uint256 repayAmount) public {
-        repayAmount = bound(repayAmount, 1 * USDC, 1_000 * USDC);
+    // =============================================================
+    // LIQUIDATION
+    // =============================================================
 
-        _createBorrowPosition();
-
+    function _createUnhealthyPosition() internal {
         vm.startPrank(alice);
 
-        usdc.mint(alice, repayAmount);
+        pool.supply(address(weth), 1e18);
 
-        usdc.approve(address(lendingPool), repayAmount);
+        // At $2,000 WETH:
+        // collateral = $2,000
+        // liquidation threshold = 85%
+        // max debt before liquidation = $1,700
+        //
+        // Borrow $1,600 so full debt liquidation remains
+        // within the available collateral after the bonus.
 
-        lendingPool.repay(address(usdc), repayAmount);
+        pool.borrow(address(usdc), 1_600e6);
 
         vm.stopPrank();
 
-        assertLe(lendingPool.getUserDebt(alice, address(usdc)), 1_000 * USDC);
+        // Price falls from $2,000 to $1,500.
+        oracle.setPrice(address(weth), 1_500e8, 8);
     }
 
-    function testFuzz_BorrowInterestAccrues(uint256 elapsedTime) public {
-        elapsedTime = bound(elapsedTime, 1 days, 365 days);
-
-        _createBorrowPosition();
-
-        uint256 beforeDebt = lendingPool.getUserDebt(alice, address(usdc));
-
-        vm.warp(block.timestamp + elapsedTime);
-
-        uint256 afterDebt = lendingPool.getUserDebt(alice, address(usdc));
-
-        assertGt(afterDebt, beforeDebt);
-    }
-
-    function testFuzz_LiquidationPrice(uint256 wethPrice) public pure {
-        wethPrice = bound(wethPrice, 1e8, 3_000e8);
-
-        // create position
-        // change oracle price
-        // calculate health factor
-        // verify liquidation behavior
-    }
-
-    function testFuzz_BorrowWithinCollateralFactor(uint256 borrowAmount) public {
-        borrowAmount = bound(borrowAmount, 1 * USDC, 4_800 * USDC);
-
-        _provideUSDC();
-
+    function test_RevertIfLiquidateHealthyPosition() public {
         vm.startPrank(alice);
 
-        weth.approve(address(lendingPool), 2 * WETH);
-
-        lendingPool.supply(address(weth), 2 * WETH);
-
-        lendingPool.borrow(address(usdc), borrowAmount);
+        pool.supply(address(weth), 1e18);
+        pool.borrow(address(usdc), 1_000e6);
 
         vm.stopPrank();
 
-        assertEq(lendingPool.getUserDebt(alice, address(usdc)), borrowAmount);
+        vm.prank(liquidator);
+
+        vm.expectRevert("LendingPool: position healthy");
+
+        pool.liquidate(alice, address(usdc), address(weth), 500e6);
     }
 
-    function testFuzz_BorrowInterestIsMonotonic(uint256 firstPeriod, uint256 secondPeriod) public {
-        firstPeriod = bound(firstPeriod, 1 days, 180 days);
-        secondPeriod = bound(secondPeriod, 1 days, 180 days);
+    function test_PartialLiquidation() public {
+        _createUnhealthyPosition();
 
-        _createBorrowPosition();
+        uint256 liquidatorUSDCBefore = usdc.balanceOf(liquidator);
 
-        uint256 initialDebt = lendingPool.getUserDebt(alice, address(usdc));
+        uint256 liquidatorWETHBefore = weth.balanceOf(liquidator);
 
-        vm.warp(block.timestamp + firstPeriod);
+        vm.prank(liquidator);
 
-        uint256 firstDebt = lendingPool.getUserDebt(alice, address(usdc));
+        pool.liquidate(alice, address(usdc), address(weth), 500e6);
 
-        vm.warp(block.timestamp + secondPeriod);
+        // $500 debt + 5% liquidation bonus = $525 collateral.
+        // At $1,500/WETH:
+        // 525 / 1500 = 0.35 WETH.
+        assertEq(weth.balanceOf(liquidator), liquidatorWETHBefore + 0.35e18);
 
-        uint256 secondDebt = lendingPool.getUserDebt(alice, address(usdc));
+        assertEq(usdc.balanceOf(liquidator), liquidatorUSDCBefore - 500e6);
 
-        assertGe(firstDebt, initialDebt);
-        assertGe(secondDebt, firstDebt);
+        assertEq(pool.getUserDebt(alice, address(usdc)), 1_100e6);
+
+        assertEq(pool.getUserCollateral(alice, address(weth)), 0.65e18);
+    }
+
+    function test_FullDebtLiquidation() public {
+        _createUnhealthyPosition();
+
+        // Alice has 1 WETH and $1,600 debt.
+        // At $1,500/WETH, 1.12 WETH is required including
+        // the 5% liquidation bonus, so full liquidation cannot
+        // succeed with only 1 WETH.
+        vm.prank(liquidator);
+
+        vm.expectRevert("LendingPool: liquidation exceeds collateral");
+
+        pool.liquidate(alice, address(usdc), address(weth), 1_600e6);
+    }
+
+    function test_RevertIfLiquidationExceedsCollateral() public {
+        _createUnhealthyPosition();
+
+        vm.prank(liquidator);
+
+        vm.expectRevert("LendingPool: liquidation exceeds collateral");
+
+        pool.liquidate(alice, address(usdc), address(weth), 1_600e6);
+    }
+
+    function test_RevertIfLiquidationExceedsDebt() public {
+        _createUnhealthyPosition();
+
+        vm.prank(liquidator);
+
+        vm.expectRevert("LendingPool: liquidation exceeds debt");
+
+        pool.liquidate(alice, address(usdc), address(weth), 2_000e6);
+    }
+
+    // =============================================================
+    // ASSET REGISTRATION
+    // =============================================================
+
+    function test_AssetRegisteredOnlyOnce() public {
+        vm.startPrank(alice);
+
+        pool.supply(address(usdc), 1e6);
+        pool.supply(address(usdc), 2e6);
+        pool.supply(address(weth), 1e18);
+
+        vm.stopPrank();
+
+        address[] memory assets = pool.getSupportedAssets();
+
+        assertEq(assets.length, 2);
+        assertEq(assets[0], address(usdc));
+        assertEq(assets[1], address(weth));
     }
 }
