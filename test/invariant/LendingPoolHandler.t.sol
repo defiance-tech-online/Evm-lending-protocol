@@ -22,6 +22,7 @@ contract LendingPoolHandler is Test {
     uint256 public repayCalls;
     uint256 public accrueCalls;
     uint256 public liquidateCalls;
+    uint256 public warpCalls;
 
     constructor(
         MockERC20 _weth,
@@ -150,23 +151,34 @@ contract LendingPoolHandler is Test {
             return;
         }
 
-        // Maximum theoretical USDC borrowing power:
-        // WETH collateral * $3000 * 80%
-        //
-        // collateral is 18 decimals
-        // price is $3000 with 8 decimals
-        // USDC is 6 decimals
+        /*
+         * WETH price:
+         *
+         * $3,000 with 8 decimals.
+         *
+         * Convert WETH collateral (18 decimals)
+         * into USD value (8 decimals).
+         */
         uint256 collateralValue = (collateral * 3000e8) / 1e18;
 
+        /*
+         * 80% collateral factor.
+         */
         uint256 maxBorrow = (collateralValue * 8_000) / 10_000;
 
-        // Convert USD value (8 decimals) to USDC (6 decimals)
+        /*
+         * Convert USD 8 decimals -> USDC 6 decimals.
+         */
         maxBorrow = maxBorrow / 1e2;
 
         if (maxBorrow == 0) {
             return;
         }
 
+        /*
+         * Borrowing is also limited by available USDC
+         * liquidity inside the LendingPool.
+         */
         uint256 poolLiquidity = usdc.balanceOf(address(lendingPool));
 
         if (poolLiquidity == 0) {
@@ -175,6 +187,10 @@ contract LendingPoolHandler is Test {
 
         if (maxBorrow > poolLiquidity) {
             maxBorrow = poolLiquidity;
+        }
+
+        if (maxBorrow == 0) {
+            return;
         }
 
         amount = bound(amount, 1, maxBorrow);
@@ -206,6 +222,10 @@ contract LendingPoolHandler is Test {
         }
 
         uint256 maxRepay = debt < balance ? debt : balance;
+
+        if (maxRepay == 0) {
+            return;
+        }
 
         amount = bound(amount, 1, maxRepay);
 
@@ -252,6 +272,10 @@ contract LendingPoolHandler is Test {
             maxAmount = liquidatorBalance;
         }
 
+        if (maxAmount == 0) {
+            return;
+        }
+
         debtAmount = bound(debtAmount, 1, maxAmount);
 
         vm.startPrank(liquidator);
@@ -281,10 +305,12 @@ contract LendingPoolHandler is Test {
     // TIME ADVANCEMENT
     // =============================================================
 
-    function advanceTime(uint256 timeDelta) public {
-        // Bound the time jump to a realistic range (e.g., 1 second to 365 days)
+    function advanceTime(uint256 timeDelta) external {
         timeDelta = bound(timeDelta, 1, 365 days);
+
         vm.warp(block.timestamp + timeDelta);
+
+        warpCalls++;
     }
 
     // =============================================================

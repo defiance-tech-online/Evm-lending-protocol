@@ -612,10 +612,10 @@ contract ReserveManagerTest is Test {
 
         manager.setLendingPool(address(this));
 
+        // Supply exists, but there are no borrowers.
         manager.increaseTotalSupplied(address(usdc), 1_000);
 
         uint256 initialBorrowIndex = manager.getBorrowIndex(address(usdc));
-
         uint256 initialSupplyIndex = manager.getSupplyIndex(address(usdc));
 
         vm.warp(block.timestamp + 365 days);
@@ -623,11 +623,12 @@ contract ReserveManagerTest is Test {
         manager.accrueInterest(address(usdc));
 
         uint256 finalBorrowIndex = manager.getBorrowIndex(address(usdc));
-
         uint256 finalSupplyIndex = manager.getSupplyIndex(address(usdc));
 
-        assertGt(finalBorrowIndex, initialBorrowIndex);
+        // No debt exists, therefore borrow interest must not accrue.
+        assertEq(finalBorrowIndex, initialBorrowIndex);
 
+        // No borrowing/utilization means no supply interest either.
         assertEq(finalSupplyIndex, initialSupplyIndex);
     }
 

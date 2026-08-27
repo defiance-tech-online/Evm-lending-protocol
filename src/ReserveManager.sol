@@ -229,16 +229,46 @@ contract ReserveManager is Ownable {
         uint256 currentSupply = _currentSupplyBalance(reserve);
         uint256 currentBorrow = _currentBorrowBalance(reserve);
 
-        uint256 borrowRate = IInterestRateModel(reserve.interestRateModel).getBorrowRate(currentSupply, currentBorrow);
+        uint256 borrowRate;
+        uint256 supplyRate;
 
-        uint256 supplyRate = IInterestRateModel(reserve.interestRateModel).getSupplyRate(currentSupply, currentBorrow);
+        // ---------------------------------------------------------
+        // BORROW INTEREST
+        // ---------------------------------------------------------
+        //
+        // A borrow index should not grow when there are no borrowers.
+        //
+        // This prevents:
+        //     borrowIndex > 1e18
+        //
+        // when:
+        //     totalScaledBorrowed == 0
+        //
+        // It also makes the accounting semantics explicit:
+        // no debt -> no debt interest.
+        //
+        if (reserve.totalScaledBorrowed > 0) {
+            borrowRate = IInterestRateModel(reserve.interestRateModel).getBorrowRate(currentSupply, currentBorrow);
 
-        uint256 borrowGrowth = (borrowRate * WAD * elapsed) / (BPS * YEAR);
-        uint256 supplyGrowth = (supplyRate * WAD * elapsed) / (BPS * YEAR);
+            uint256 borrowGrowth = (borrowRate * WAD * elapsed) / (BPS * YEAR);
 
-        reserve.borrowIndex = reserve.borrowIndex + (reserve.borrowIndex * borrowGrowth) / WAD;
+            reserve.borrowIndex = reserve.borrowIndex + (reserve.borrowIndex * borrowGrowth) / WAD;
+        }
 
-        reserve.supplyIndex = reserve.supplyIndex + (reserve.supplyIndex * supplyGrowth) / WAD;
+        // ---------------------------------------------------------
+        // SUPPLY INTEREST
+        // ---------------------------------------------------------
+        //
+        // Supply interest can still accrue when there is supplied
+        // liquidity. This is independent from the borrow index.
+        //
+        if (reserve.totalScaledSupplied > 0) {
+            supplyRate = IInterestRateModel(reserve.interestRateModel).getSupplyRate(currentSupply, currentBorrow);
+
+            uint256 supplyGrowth = (supplyRate * WAD * elapsed) / (BPS * YEAR);
+
+            reserve.supplyIndex = reserve.supplyIndex + (reserve.supplyIndex * supplyGrowth) / WAD;
+        }
 
         reserve.lastUpdateTimestamp = block.timestamp;
     }
@@ -268,6 +298,11 @@ contract ReserveManager is Ownable {
             return reserve.borrowIndex;
         }
 
+        // No debt means no borrow interest.
+        if (reserve.totalScaledBorrowed == 0) {
+            return reserve.borrowIndex;
+        }
+
         uint256 elapsed = block.timestamp - reserve.lastUpdateTimestamp;
 
         if (elapsed == 0) {
@@ -275,6 +310,7 @@ contract ReserveManager is Ownable {
         }
 
         uint256 currentSupply = _currentSupplyBalance(reserve);
+
         uint256 currentBorrow = _currentBorrowBalance(reserve);
 
         uint256 borrowRate = IInterestRateModel(reserve.interestRateModel).getBorrowRate(currentSupply, currentBorrow);
@@ -289,6 +325,11 @@ contract ReserveManager is Ownable {
             return reserve.supplyIndex;
         }
 
+        // No supplied liquidity means no supply interest.
+        if (reserve.totalScaledSupplied == 0) {
+            return reserve.supplyIndex;
+        }
+
         uint256 elapsed = block.timestamp - reserve.lastUpdateTimestamp;
 
         if (elapsed == 0) {
@@ -296,6 +337,7 @@ contract ReserveManager is Ownable {
         }
 
         uint256 currentSupply = _currentSupplyBalance(reserve);
+
         uint256 currentBorrow = _currentBorrowBalance(reserve);
 
         uint256 supplyRate = IInterestRateModel(reserve.interestRateModel).getSupplyRate(currentSupply, currentBorrow);
@@ -349,9 +391,7 @@ contract ReserveManager is Ownable {
         reserve.decimals = decimals;
 
         reserve.collateralFactor = collateralFactor;
-
         reserve.liquidationThreshold = liquidationThreshold;
-
         reserve.liquidationBonus = liquidationBonus;
 
         reserve.totalScaledSupplied = 0;
@@ -419,14 +459,19 @@ contract ReserveManager is Ownable {
         ReserveTypes.Reserve storage reserve = reserves[asset];
 
         require(reserve.lastUpdateTimestamp != 0, "Reserve: not configured");
+
         require(reserve.interestRateModel != model, "Reserve: same interest rate model");
 
-        // Accrue interest using the OLD model before switching.
+        // IMPORTANT:
+        // Accrue the elapsed period with the OLD model BEFORE
+        // replacing the model address.
         if (reserve.interestRateModel != address(0)) {
             accrueInterest(asset);
         }
 
         reserve.interestRateModel = model;
+
+        emit InterestRateModelUpdated(asset, model);
     }
 
     function getInterestRateModel(address asset) external view returns (address) {
