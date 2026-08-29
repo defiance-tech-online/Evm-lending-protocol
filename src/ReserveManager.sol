@@ -262,7 +262,7 @@ contract ReserveManager is Ownable {
         // Supply interest can still accrue when there is supplied
         // liquidity. This is independent from the borrow index.
         //
-        if (reserve.totalScaledSupplied > 0) {
+        if (reserve.totalScaledSupplied > 0 && reserve.totalScaledBorrowed > 0) {
             supplyRate = IInterestRateModel(reserve.interestRateModel).getSupplyRate(currentSupply, currentBorrow);
 
             uint256 supplyGrowth = (supplyRate * WAD * elapsed) / (BPS * YEAR);
@@ -326,7 +326,7 @@ contract ReserveManager is Ownable {
         }
 
         // No supplied liquidity means no supply interest.
-        if (reserve.totalScaledSupplied == 0) {
+        if (reserve.totalScaledSupplied == 0 || reserve.totalScaledBorrowed == 0) {
             return reserve.supplyIndex;
         }
 
@@ -371,6 +371,7 @@ contract ReserveManager is Ownable {
         uint256 liquidationBonus
     ) external onlyOwner {
         require(asset != address(0), "Reserve: zero asset");
+        require(decimals <= 18, "Reserve: decimals too high");
 
         ReserveTypes.Reserve storage reserve = reserves[asset];
 

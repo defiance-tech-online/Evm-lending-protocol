@@ -4,13 +4,14 @@ pragma solidity ^0.8.24;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 import {ReserveManager} from "./ReserveManager.sol";
 import {RiskManager} from "./RiskManager.sol";
 import {UserTypes} from "./libraries/UserTypes.sol";
 import {IPositionProvider} from "./interfaces/IPositionProvider.sol";
 
-contract LendingPool is IPositionProvider, Ownable {
+contract LendingPool is IPositionProvider, Ownable, ReentrancyGuard {
     using UserTypes for UserTypes.Position;
     using SafeERC20 for IERC20;
 
@@ -62,7 +63,7 @@ contract LendingPool is IPositionProvider, Ownable {
     // SUPPLY
     // =============================================================
 
-    function supply(address asset, uint256 amount) external {
+    function supply(address asset, uint256 amount) external nonReentrant {
         require(amount > 0, "LendingPool: zero supply");
 
         _requireActive(asset);
@@ -86,8 +87,9 @@ contract LendingPool is IPositionProvider, Ownable {
     // WITHDRAW
     // =============================================================
 
-    function withdraw(address asset, uint256 amount) external {
+    function withdraw(address asset, uint256 amount) external nonReentrant {
         require(amount > 0, "LendingPool: zero withdraw");
+        require(address(riskManager) != address(0), "LendingPool: risk manager not set");
 
         _requireActive(asset);
         _accrue(asset);
@@ -100,12 +102,20 @@ contract LendingPool is IPositionProvider, Ownable {
         require(currentBalance >= amount, "LendingPool: insufficient collateral");
         require(IERC20(asset).balanceOf(address(this)) >= amount, "LendingPool: insufficient liquidity");
 
+        require(
+            riskManager.canWithdraw(msg.sender, asset, amount), "LendingPool: withdrawal would make position unhealthy"
+        );
+
         uint256 scaledAmount = reserveManager.decreaseTotalSupplied(asset, amount);
 
         require(position.supplied >= scaledAmount, "LendingPool: scaled collateral underflow");
 
         position.supplied -= scaledAmount;
         position.supplyIndex = currentIndex;
+
+        if (position.borrowed > 0) {
+            require(riskManager.calculateHealthFactor(msg.sender) >= WAD, "LendingPool: unhealthy position");
+        }
 
         IERC20(asset).safeTransfer(msg.sender, amount);
 
@@ -116,7 +126,7 @@ contract LendingPool is IPositionProvider, Ownable {
     // BORROW
     // =============================================================
 
-    function borrow(address asset, uint256 amount) external {
+    function borrow(address asset, uint256 amount) external nonReentrant {
         require(amount > 0, "LendingPool: zero borrow");
 
         _requireActive(asset);
@@ -147,7 +157,7 @@ contract LendingPool is IPositionProvider, Ownable {
     // REPAY
     // =============================================================
 
-    function repay(address asset, uint256 amount) external {
+    function repay(address asset, uint256 amount) external nonReentrant {
         require(amount > 0, "LendingPool: zero repay");
 
         _requireActive(asset);
@@ -185,8 +195,12 @@ contract LendingPool is IPositionProvider, Ownable {
     // LIQUIDATION
     // =============================================================
 
-    function liquidate(address user, address debtAsset, address collateralAsset, uint256 debtAmount) external {
+    function liquidate(address user, address debtAsset, address collateralAsset, uint256 debtAmount)
+        external
+        nonReentrant
+    {
         require(user != address(0), "LendingPool: zero user");
+        require(user != msg.sender, "LendingPool: cannot liquidate self");
         require(debtAmount > 0, "LendingPool: zero debt amount");
         require(address(riskManager) != address(0), "LendingPool: risk manager not set");
 

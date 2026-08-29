@@ -11,6 +11,7 @@ interface IRiskManager {
     function calculateHealthFactor(address user) external view returns (uint256);
 
     function canBorrow(address user, address asset, uint256 amount) external view returns (bool);
+    function canWithdraw(address user, address asset, uint256 amount) external view returns (bool);
 
     function canLiquidate(address user) external view returns (bool);
 

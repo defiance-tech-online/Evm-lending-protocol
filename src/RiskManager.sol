@@ -96,6 +96,57 @@ contract RiskManager is IRiskManager {
     }
 
     // =============================================================
+    // WITHDRAW VALIDATION
+    // =============================================================
+
+    function canWithdraw(address user, address asset, uint256 amount) external view returns (bool) {
+        if (amount == 0) {
+            return false;
+        }
+
+        uint256 collateralValue;
+        uint256 debtValue;
+
+        address[] memory assets = positionProvider.getSupportedAssets();
+
+        for (uint256 i = 0; i < assets.length; i++) {
+            address currentAsset = assets[i];
+
+            uint256 supplied = positionProvider.getUserCollateral(user, currentAsset);
+            uint256 borrowed = positionProvider.getUserDebt(user, currentAsset);
+
+            // Remove the requested withdrawal from this asset's collateral.
+            if (currentAsset == asset) {
+                if (supplied < amount) {
+                    return false;
+                }
+
+                supplied -= amount;
+            }
+
+            if (supplied > 0) {
+                uint256 value = _getAssetValue(currentAsset, supplied);
+
+                uint256 liquidationThreshold = reserveManager.getLiquidationThreshold(currentAsset);
+
+                collateralValue += (value * liquidationThreshold) / BPS;
+            }
+
+            if (borrowed > 0) {
+                debtValue += _getAssetValue(currentAsset, borrowed);
+            }
+        }
+
+        // No debt means the withdrawal is safe.
+        if (debtValue == 0) {
+            return true;
+        }
+
+        // After withdrawal, health factor must remain >= 1.
+        return collateralValue >= debtValue;
+    }
+
+    // =============================================================
     // LIQUIDATION
     // =============================================================
 
@@ -162,6 +213,10 @@ contract RiskManager is IRiskManager {
 
         uint256 normalizedAmount;
 
+        require(amount > 0, "RiskManager: zero amount");
+        require(tokenDecimals <= 18, "RiskManager: invalid token decimals");
+        require(priceDecimals <= 18, "RiskManager: invalid price decimals");
+
         if (tokenDecimals < 18) {
             normalizedAmount = amount * 10 ** (18 - tokenDecimals);
         } else if (tokenDecimals > 18) {
@@ -185,6 +240,10 @@ contract RiskManager is IRiskManager {
         uint8 priceDecimals = priceOracle.getPriceDecimals(asset);
 
         uint8 tokenDecimals = reserveManager.getDecimals(asset);
+
+        require(value > 0, "RiskManager: zero value");
+        require(tokenDecimals <= 18, "RiskManager: invalid token decimals");
+        require(priceDecimals <= 18, "RiskManager: invalid price decimals");
 
         if (priceDecimals < 18) {
             price *= 10 ** (18 - priceDecimals);

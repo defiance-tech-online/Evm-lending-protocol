@@ -18,3 +18,8 @@ docs/
 .env
 .env.*
 !.env.example
+
+# Foundry build/runtime artifacts
+cache/
+out/
+broadcast/
